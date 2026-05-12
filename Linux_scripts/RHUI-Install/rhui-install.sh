@@ -46,11 +46,28 @@ section "Detecting Operating System"
 [ -f /etc/os-release ] || fail "OS detection failed"
 
 source /etc/os-release
+
 OS_VERSION=$(echo "$VERSION_ID" | cut -d '.' -f1)
-OS_MINOR=$(echo "$VERSION_ID" | cut -d '.' -f2)
+OS_MINOR=$(echo "${VERSION_ID#*.}" | cut -d '.' -f1)
+OS_MINOR=${OS_MINOR:-0}
 
 ok "OS        : $PRETTY_NAME"
 ok "Version   : $OS_VERSION"
+ok "Minor     : $OS_MINOR"
+
+#--------------------------------------------------
+# Last Supported Minor Version Detection
+#--------------------------------------------------
+LAST_MINOR_RELEASE=0
+
+# RHEL 7  -> 7.9
+# RHEL 8+ -> x.10
+
+if [[ "$OS_VERSION" == "7" && "$OS_MINOR" == "9" ]]; then
+    LAST_MINOR_RELEASE=1
+elif [[ "$OS_VERSION" -ge 8 && "$OS_MINOR" == "10" ]]; then
+    LAST_MINOR_RELEASE=1
+fi
 
 #--------------------------------------------------
 # 2. RHUI Check
@@ -101,77 +118,74 @@ fi
 ok "Detected Image Type : $IMAGE_SUFFIX"
 
 #--------------------------------------------------
-# 5. Preview Available RHUI Packages
+# Unsupported SAP / HA Minor Version Validation
 #--------------------------------------------------
-section "Preview Available RHUI Packages"
-#BASE_REPO means NON-EUS.
-BASE_REPO="microsoft-azure-rhel${OS_VERSION}"
-EUS_REPO="microsoft-azure-rhel${OS_VERSION}-eus"
 
-if [[ "$IMAGE_SUFFIX" == "sapapps" ]]; then
-    if [[ "$OS_VERSION.$OS_MINOR" == "7.9" || "$OS_VERSION.$OS_MINOR" == "8.10" ]]; then
-        BASE_REPO="${BASE_REPO}-base-sap-apps"
-        FILTER="rhui-azure-rhel${OS_VERSION}-base-sap-apps*"
-        LABEL="BASE packages:"
-    else
-        BASE_REPO="${BASE_REPO}-sapapps"
-        FILTER="rhui-azure-rhel${OS_VERSION}-sapapps*"
-        LABEL="EUS/E4S packages:"
+if [[ "$IMAGE_SUFFIX" == "sapapps" || \
+      "$IMAGE_SUFFIX" == "sap-ha" || \
+      "$IMAGE_SUFFIX" == "ha" ]]; then
+    section "Validating Supported Minor Version"
+    SUPPORTED_VERSION=0
+
+    # Last supported releases
+    if [[ "$LAST_MINOR_RELEASE" -eq 1 ]]; then
+        SUPPORTED_VERSION=1
+
+    # Supported EUS/E4S releases = even minor versions
+    elif (( OS_MINOR % 2 == 0 )); then
+        SUPPORTED_VERSION=1
     fi
-elif [[ "$IMAGE_SUFFIX" == "sap-ha" ]]; then
-    if [[ "$OS_VERSION.$OS_MINOR" == "7.9" || "$OS_VERSION.$OS_MINOR" == "8.10" ]]; then
-        BASE_REPO="${BASE_REPO}-base-sap-ha"
-        FILTER="rhui-azure-rhel${OS_VERSION}-base-sap-ha*"
-        LABEL="BASE packages:"
-    else
-        BASE_REPO="${BASE_REPO}-sap-ha"
-        FILTER="rhui-azure-rhel${OS_VERSION}-sap-ha*"
-        LABEL="EUS/E4S packages:"
+
+    if [[ "$SUPPORTED_VERSION" -ne 1 ]]; then
+
+        echo
+        fail "Detected unsupported OS minor version: $OS_VERSION.$OS_MINOR
+
+This VM appears to have been updated using incorrect repositories/packages.
+
+Supported versions for $IMAGE_SUFFIX images include:
+  - Even-numbered EUS/E4S minor releases
+  - Last supported x.10 releases
+
+Examples:
+  - 8.2
+  - 8.4
+  - 8.6
+  - 8.8
+  - 8.10
+  - 9.2
+  - 9.4
+  - 9.6
+  - 9.8
+  - 9.10
+
+Current detected version:
+  - $OS_VERSION.$OS_MINOR
+
+Recommended action:
+  Create a support case with Microsoft to validate and correct RHUI/repository configuration."
     fi
-elif [[ "$IMAGE_SUFFIX" == "ha" ]]; then
-    if [[ "$OS_VERSION.$OS_MINOR" == "7.9" || "$OS_VERSION.$OS_MINOR" == "8.10" ]]; then
-        BASE_REPO="${BASE_REPO}-base-ha"
-        FILTER="rhui-azure-rhel${OS_VERSION}-base-ha*"
-        LABEL="BASE packages:"
-    else
-        BASE_REPO="${BASE_REPO}-ha"
-        FILTER="rhui-azure-rhel${OS_VERSION}-ha*"
-        LABEL="EUS/E4S packages:"
-    fi
-else
-    FILTER="rhui-azure-rhel${OS_VERSION}*"
-    LABEL="Base (Non-EUS) packages:"
+
+    ok "Supported OS minor version detected"
+
 fi
 
-PREVIEW_CONFIG="/tmp/rhui-preview.repo"
+#--------------------------------------------------
+# 5. RHUI Support Model Detection
+#--------------------------------------------------
+section "RHUI Support Model Detection"
 
-cat <<EOF > "$PREVIEW_CONFIG"
-[$BASE_REPO]
-name=Base Repo
-baseurl=https://${RHUI_HOST}/pulp/repos/unprotected/${BASE_REPO}
-enabled=1
-gpgcheck=0
-sslverify=1
-EOF
+#--------------------------------------------------
+# Check EUS availability for STANDARD images
+#--------------------------------------------------
+EUS_AVAILABLE=0
 
-BASE_PKGS=$(repo_query "$PREVIEW_CONFIG" "%{name}-%{version}-%{release}.%{arch}" "$FILTER" | sort -u)
-
-echo "$LABEL"
-if [[ -n "$BASE_PKGS" ]]; then
-    echo "$BASE_PKGS" | sed 's/^/  - /'
-    ok "Packages are available"
-else
-    echo "  (none found)"
-    warn "No packages found"
-fi
-
-# Only show EUS section for STANDARD images
 if [[ "$IMAGE_SUFFIX" == "standard" ]]; then
 
-echo
-echo "EUS-specific packages:"
+    EUS_REPO="microsoft-azure-rhel${OS_VERSION}-eus"
+    PREVIEW_CONFIG="/tmp/rhui-preview.repo"
 
-cat <<EOF >> "$PREVIEW_CONFIG"
+    cat <<EOF > "$PREVIEW_CONFIG"
 [$EUS_REPO]
 name=EUS Repo
 baseurl=https://${RHUI_HOST}/pulp/repos/unprotected/${EUS_REPO}
@@ -180,68 +194,61 @@ gpgcheck=0
 sslverify=1
 EOF
 
-EUS_PKGS=$(repo_query "$PREVIEW_CONFIG" "%{name}-%{version}-%{release}.%{arch}" "rhui-azure-rhel${OS_VERSION}-eus*" | sort -u)
+    EUS_PKGS=$(repo_query "$PREVIEW_CONFIG" "%{name}" "rhui-azure-rhel${OS_VERSION}-eus*" | sort -u)
 
-if [[ -n "$EUS_PKGS" ]]; then
-    echo "$EUS_PKGS" | sed 's/^/  - /'
-    ok "EUS is available"
-else
-    echo "  (not available)"
-    warn "EUS is NOT available"
-fi
+    if [[ -n "$EUS_PKGS" ]]; then
+        EUS_AVAILABLE=1
+    fi
+
+    rm -f "$PREVIEW_CONFIG"
 
 fi
-
-rm -f "$PREVIEW_CONFIG"
 
 #--------------------------------------------------
-# 6. EUS / Non-EUS Selection
+# 6. Automatic EUS / Non-EUS Decision
 #--------------------------------------------------
-section "EUS / Non-EUS Selection"
-
-USE_BASE=0
-if [[ "$OS_VERSION.$OS_MINOR" == "7.9" || "$OS_VERSION.$OS_MINOR" == "8.10" ]]; then
-    USE_BASE=1
-fi
-
-EUS_AVAILABLE=0
-if [[ "$IMAGE_SUFFIX" == "standard" && -n "${EUS_PKGS:-}" ]]; then
-    EUS_AVAILABLE=1
-fi
 
 if [[ "$IMAGE_SUFFIX" != "standard" ]]; then
 
-    if [[ "$USE_BASE" -eq 1 ]]; then
+    if [[ "$LAST_MINOR_RELEASE" -eq 1 ]]; then
         warn "EUS is not applicable for this system"
         echo ""
-        info "Proceeding with BASE automatically"
-        MODE="BASE"
+        info "Proceeding with BASE RHUI package automatically"
     else
         warn "Non-EUS is not applicable for this system"
         echo ""
-        info "Proceeding with EUS automatically"
-        MODE="1"
+        info "Proceeding with EUS RHUI package automatically"
     fi
 
 else
 
-    if [[ "$EUS_AVAILABLE" -eq 1 ]]; then
-        echo "Choose support model:"
-        line
-        echo "1) EUS / E4S (Extended Update Support)"
-        echo "   - Provides longer lifecycle for a specific RHEL minor version"
-        echo "   - Recommended for stability"
-        echo
-        echo "2) Non-EUS / Base"
-        echo "   - Always available"
-        echo
-        read -p "Enter choice [1-2] (default: 1): " MODE
-        MODE=${MODE:-1}
-    else
-        warn "EUS is not available for this system"
-        echo ""
-        info "Proceeding with Non-EUS automatically"
+    # Last supported minor versions should always use Non-EUS
+    if [[ "$LAST_MINOR_RELEASE" -eq 1 ]]; then
+
+        info "Detected last supported minor version ($OS_VERSION.$OS_MINOR)"
+        info "Proceeding with Non-EUS RHUI package automatically"
         MODE="2"
+
+    # Even minor version -> EUS
+    # Odd minor version  -> Non-EUS
+    elif (( OS_MINOR % 2 == 0 )); then
+
+        if [[ "$EUS_AVAILABLE" -eq 1 ]]; then
+            info "Detected OS version ($OS_VERSION.$OS_MINOR)"
+            info "Proceeding with EUS RHUI package automatically"
+            MODE="1"
+        else
+            warn "Even minor version detected but EUS repo not available"
+            info "Proceeding with Non-EUS automatically"
+            MODE="2"
+        fi
+
+    else
+
+        info "Detected ODD minor version ($OS_MINOR)"
+        info "Proceeding with Non-EUS RHUI package automatically"
+        MODE="2"
+
     fi
 
 fi
@@ -254,8 +261,9 @@ section "Selecting RHUI Package"
 PKG_BASE="rhui-azure-rhel${OS_VERSION}"
 
 case "$IMAGE_SUFFIX" in
+
     sapapps)
-        if [[ "$OS_VERSION.$OS_MINOR" == "7.9" || "$OS_VERSION.$OS_MINOR" == "8.10" ]]; then
+        if [[ "$LAST_MINOR_RELEASE" -eq 1 ]]; then
             PKG="${PKG_BASE}-base-sap-apps"
             REPO_NAME="microsoft-azure-rhel${OS_VERSION}-base-sap-apps"
         else
@@ -263,8 +271,9 @@ case "$IMAGE_SUFFIX" in
             REPO_NAME="microsoft-azure-rhel${OS_VERSION}-sapapps"
         fi
         ;;
+
     sap-ha)
-        if [[ "$OS_VERSION.$OS_MINOR" == "7.9" || "$OS_VERSION.$OS_MINOR" == "8.10" ]]; then
+        if [[ "$LAST_MINOR_RELEASE" -eq 1 ]]; then
             PKG="${PKG_BASE}-base-sap-ha"
             REPO_NAME="microsoft-azure-rhel${OS_VERSION}-base-sap-ha"
         else
@@ -272,8 +281,9 @@ case "$IMAGE_SUFFIX" in
             REPO_NAME="microsoft-azure-rhel${OS_VERSION}-sap-ha"
         fi
         ;;
+
     ha)
-        if [[ "$OS_VERSION.$OS_MINOR" == "7.9" || "$OS_VERSION.$OS_MINOR" == "8.10" ]]; then
+        if [[ "$LAST_MINOR_RELEASE" -eq 1 ]]; then
             PKG="${PKG_BASE}-base-ha"
             REPO_NAME="microsoft-azure-rhel${OS_VERSION}-base-ha"
         else
@@ -281,10 +291,12 @@ case "$IMAGE_SUFFIX" in
             REPO_NAME="microsoft-azure-rhel${OS_VERSION}-ha"
         fi
         ;;
+
     sap)
         PKG="${PKG_BASE}-sap"
         REPO_NAME="microsoft-azure-rhel${OS_VERSION}-sap"
         ;;
+
     standard)
         if [[ "$MODE" == "1" ]]; then
             PKG="${PKG_BASE}-eus"
@@ -294,10 +306,11 @@ case "$IMAGE_SUFFIX" in
             REPO_NAME="microsoft-azure-rhel${OS_VERSION}"
         fi
         ;;
+
 esac
 
 ok "Selected Package : $PKG"
-ok "Repo Name : $REPO_NAME"
+ok "Repo Name        : $REPO_NAME"
 
 #--------------------------------------------------
 # 8. Create Repo
@@ -322,6 +335,7 @@ ok "Repository file created"
 # 9. Install RHUI
 #--------------------------------------------------
 section "Installing RHUI Package"
+
 PM=$(pkg_mgr)
 TMP_LOG="/tmp/rhui_install.log"
 
@@ -339,7 +353,6 @@ fi
 
 ok "Installed: $PKG"
 
-rm -f "$CONFIG_FILE" "$TMP_LOG"
 #--------------------------------------------------
 # 10. VERSION LOCK
 #--------------------------------------------------
@@ -350,7 +363,7 @@ SET_LOCK=0
 
 # SAP / HA → only if NOT base versions
 if [[ "$IMAGE_SUFFIX" != "standard" ]]; then
-    if [[ "$OS_VERSION.$OS_MINOR" != "7.9" && "$OS_VERSION.$OS_MINOR" != "8.10" ]]; then
+    if [[ "$LAST_MINOR_RELEASE" -ne 1 ]]; then
         SET_LOCK=1
     fi
 fi
@@ -383,9 +396,11 @@ fi
 section "Validating Installation"
 
 rpm -qa | grep -i rhui || fail "RHUI install failed"
+
 ok "RHUI package verified"
 
 $PM repolist >/dev/null 2>&1 || fail "Repo access failed"
+
 ok "Repositories accessible"
 
 #--------------------------------------------------
@@ -396,10 +411,12 @@ section "Installation Complete"
 echo "RHUI installation completed successfully!"
 echo
 echo "Summary"
+
 line
+
 echo "OS        : $PRETTY_NAME"
-echo "Version   : $OS_VERSION"
 echo "Image     : $IMAGE_SUFFIX"
 echo "Repo      : $REPO_NAME"
 echo "Package   : $(rpm -qa | grep -i rhui)"
+
 line
